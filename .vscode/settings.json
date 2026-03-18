@@ -14,5 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=d:\\Workspace\\ESP\\Tamplate\\sample_project\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "C_Cpp.errorSquiggles": "disabled"
 }

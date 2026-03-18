@@ -1,15 +1,21 @@
 #include <string.h>
 #include "ssd1306.h"
-#include "i2c.h"
+#include "esp_log.h"
+#include "esp_check.h"
+
+static const char *TAG = "ssd1306";
+
+/* Device handle stored internally after ssd1306_init() */
+static i2c_master_dev_handle_t s_dev = NULL;
 
 /* ------------------------------------------------------------------ */
 /*  Frame buffer                                                        */
 /* ------------------------------------------------------------------ */
 
-uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
+static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 
 /* ------------------------------------------------------------------ */
-/*  Built-in 5x7 ASCII font  (32..126)                                 */
+/*  Built-in 5x7 ASCII font  (0x20..0x7E)                              */
 /*  Each glyph = 5 bytes; each byte = one column; bit 0 = top row.    */
 /* ------------------------------------------------------------------ */
 
@@ -117,28 +123,53 @@ static const uint8_t font5x7[][5] = {
 #define CHAR_W      6    /* glyph + 1 px gap   */
 
 /* ------------------------------------------------------------------ */
-/*  Low-level helpers                                                   */
+/*  Low-level helpers — ESP-IDF v5.x new I2C master API               */
 /* ------------------------------------------------------------------ */
 
-static void send_cmd(uint8_t cmd)
+/*
+ * Send one or more command bytes to the SSD1306.
+ *
+ * Wire format:  START | ADDR+W | 0x00 (Co=0, D/C#=0) | cmd... | STOP
+ *
+ * The new API does not use cmd-link objects. Instead we build a small
+ * tx buffer:  [ control_byte | payload... ]  and call transmit once.
+ */
+static esp_err_t send_cmd_buf(const uint8_t *cmds, size_t len)
 {
-    uint8_t buf[2] = { SSD1306_CTRL_CMD, cmd };
-    i2c_write(SSD1306_ADDR, buf, sizeof(buf));
+    /* 1 control byte + up to len command bytes — keep it on the stack */
+    uint8_t tx[1 + 32];   /* 32 cmd bytes is more than enough for init */
+    if (len > sizeof(tx) - 1) return ESP_ERR_INVALID_SIZE;
+
+    tx[0] = SSD1306_CTRL_CMD;
+    memcpy(tx + 1, cmds, len);
+
+    esp_err_t ret = i2c_master_transmit(s_dev, tx, 1 + len,
+                                        SSD1306_I2C_TIMEOUT_MS);
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "send_cmd_buf failed: %s", esp_err_to_name(ret));
+
+    return ret;
 }
 
-static void send_cmd2(uint8_t cmd, uint8_t arg)
+static inline esp_err_t send_cmd(uint8_t cmd)
 {
-    uint8_t buf[3] = { SSD1306_CTRL_CMD, cmd, arg };
-    i2c_write(SSD1306_ADDR, buf, sizeof(buf));
+    return send_cmd_buf(&cmd, 1);
+}
+
+static esp_err_t send_cmd2(uint8_t cmd, uint8_t arg)
+{
+    uint8_t buf[2] = { cmd, arg };
+    return send_cmd_buf(buf, sizeof(buf));
 }
 
 /* ------------------------------------------------------------------ */
 /*  Initialisation sequence for 128x32                                 */
 /* ------------------------------------------------------------------ */
 
-void ssd1306_init(void)
+void ssd1306_init(i2c_master_dev_handle_t dev_handle)
 {
-    send_cmd(SSD1306_DISPLAY_OFF);
+    s_dev = dev_handle;
+    send_cmd (SSD1306_DISPLAY_OFF);
 
     send_cmd2(SSD1306_SET_DISPLAY_CLOCK_DIV, 0x80);  /* recommended ratio */
     send_cmd2(SSD1306_SET_MULTIPLEX,         0x1F);  /* 32 lines          */
@@ -146,7 +177,7 @@ void ssd1306_init(void)
     send_cmd (SSD1306_SET_START_LINE | 0x00);
     send_cmd2(SSD1306_CHARGE_PUMP,           0x14);  /* internal VCC      */
     send_cmd2(SSD1306_MEMORY_MODE,           0x00);  /* horizontal addr   */
-    send_cmd (SSD1306_SEG_REMAP_FLIP);               /* col 127 → SEG0    */
+    send_cmd (SSD1306_SEG_REMAP_FLIP);               /* col 127 → SEG0   */
     send_cmd (SSD1306_COM_SCAN_DEC);
     send_cmd2(SSD1306_SET_COM_PINS,          0x02);  /* 32-line config    */
     send_cmd2(SSD1306_SET_CONTRAST,          0xCF);
@@ -167,22 +198,27 @@ void ssd1306_init(void)
 void ssd1306_update(void)
 {
     /* Set column and page window to cover the full display */
-    send_cmd(SSD1306_COLUMN_ADDR);
-    send_cmd(0);                          /* start column */
-    send_cmd(SSD1306_WIDTH - 1);          /* end column   */
-
-    send_cmd(SSD1306_PAGE_ADDR);
-    send_cmd(0);                          /* start page   */
-    send_cmd((SSD1306_HEIGHT / 8) - 1);  /* end page     */
+    uint8_t addr_cmds[] = {
+        SSD1306_COLUMN_ADDR, 0, SSD1306_WIDTH - 1,
+        SSD1306_PAGE_ADDR,   0, (SSD1306_HEIGHT / 8) - 1,
+    };
+    send_cmd_buf(addr_cmds, sizeof(addr_cmds));
 
     /*
-     * The I2C payload: 1 control byte + 512 data bytes.
-     * We build a temporary buffer on the stack to send in one transaction.
+     * Send the frame buffer in one I2C transaction:
+     *   [ 0x40 | 512 bytes of framebuffer ]
+     *
+     * We need a contiguous tx buffer: 1 control byte + 512 data bytes.
+     * Declared static to avoid a 513-byte stack allocation.
      */
-    uint8_t tx[1 + sizeof(buffer)];
+    static uint8_t tx[1 + SSD1306_WIDTH * SSD1306_HEIGHT / 8];
     tx[0] = SSD1306_CTRL_DATA;
     memcpy(tx + 1, buffer, sizeof(buffer));
-    i2c_write(SSD1306_ADDR, tx, sizeof(tx));
+
+    esp_err_t ret = i2c_master_transmit(s_dev, tx, sizeof(tx),
+                                        SSD1306_I2C_TIMEOUT_MS);
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "ssd1306_update failed: %s", esp_err_to_name(ret));
 }
 
 /* ------------------------------------------------------------------ */
@@ -209,11 +245,9 @@ void ssd1306_draw_pixel(uint8_t x, uint8_t y, uint8_t color)
 
 void ssd1306_draw_char(uint8_t x, uint8_t y, const uint8_t *glyph)
 {
-    for (uint8_t col = 0; col < GLYPH_W; col++)
-    {
+    for (uint8_t col = 0; col < GLYPH_W; col++) {
         uint8_t column_data = glyph[col];
-        for (uint8_t row = 0; row < 8; row++)
-        {
+        for (uint8_t row = 0; row < 8; row++) {
             if (column_data & (1u << row))
                 ssd1306_draw_pixel(x + col, y + row, SSD1306_WHITE);
         }
@@ -222,13 +256,11 @@ void ssd1306_draw_char(uint8_t x, uint8_t y, const uint8_t *glyph)
 
 void ssd1306_draw_string(uint8_t x, uint8_t y, const char *str)
 {
-    while (*str)
-    {
+    while (*str) {
         uint8_t c = (uint8_t)*str;
 
         if (c >= FONT_FIRST && c <= FONT_LAST)
             ssd1306_draw_char(x, y, font5x7[c - FONT_FIRST]);
-        /* characters outside range are silently skipped (blank space) */
 
         x += CHAR_W;
         str++;

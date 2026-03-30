@@ -1,46 +1,29 @@
-#include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "shared_state.h"
+#include "i2c_bus.h"
+#include <string.h>
 #include "ssd1306.h"
+#include "task_sensors.h"
 
-// todo:
-// - додати бібліотеку та перенести туди функції конфігерації i2c
-// - залити проект на __gid_t
-// багатострокові коментарі
+SystemState       g_state       = {0};
+SemaphoreHandle_t g_state_mutex = NULL;
 
-/* ---- Adjust pins to your board ---- */
-#define I2C_SCL_PIN     22
-#define I2C_SDA_PIN     21
-#define I2C_BUS_SPEED   400000   /* 400 kHz */
+void task_sensors(void *p);
+void task_display(void *p);
+void task_system(void *p);
 
 void app_main(void)
 {
-    /* 1. Create I2C bus */
-    i2c_master_bus_config_t bus_cfg = 
-    {
-        .i2c_port            = I2C_NUM_0,
-        .sda_io_num          = I2C_SDA_PIN,
-        .scl_io_num          = I2C_SCL_PIN,
-        .clk_source          = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt   = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    i2c_master_bus_handle_t bus;
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+    i2c_bus_init();
+    bh1750_init();
+    ssd1306_init();
 
-    /* 2. Add SSD1306 device to the bus */
-    i2c_device_config_t dev_cfg = 
-    {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = SSD1306_I2C_ADDR,
-        .scl_speed_hz    = I2C_BUS_SPEED,
-    };
-    i2c_master_dev_handle_t ssd1306_dev;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &ssd1306_dev));
+    g_state_mutex = xSemaphoreCreateMutex();
+    strncpy(g_state.status, "INIT", sizeof(g_state.status) - 1);
 
-    /* 3. Initialize the display — pass handle once, library stores it */
-    ssd1306_init(ssd1306_dev);
-
-    /* 4. Draw something */
-    ssd1306_fill(SSD1306_BLACK);
-    ssd1306_draw_string(42, 16, "Hello ESP32!");
-    ssd1306_update();
+    xTaskCreate(task_sensors, "sensors", 4096, NULL, 3, NULL);
+    xTaskCreate(task_display, "display", 4096, NULL, 2, NULL);
+    xTaskCreate(task_system,  "system",  2048, NULL, 1, NULL);
 }
